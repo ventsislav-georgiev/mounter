@@ -9,8 +9,9 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 // ── SFTP protocol constants ──────────────────────────────────────────
 
@@ -62,7 +63,8 @@ pub const SSH_FXF_APPEND: u32 = 0x0000_0004;
 const SFTP_PROTO_VERSION: u32 = 3;
 const MAX_READ_SIZE: u32 = 262144; // 256KB — most servers support this
 const MAX_WRITE_SIZE: u32 = 262144;
-const READ_PIPELINE: usize = 8; // concurrent READ requests
+const READ_PIPELINE: usize = 32; // concurrent READ requests
+const WRITE_PIPELINE: usize = 16; // concurrent WRITE requests
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -299,9 +301,11 @@ impl SftpSession {
 
         let mut cmd = Command::new("ssh");
         cmd.arg("-oStrictHostKeyChecking=accept-new")
+            .arg("-oConnectTimeout=30")
             .arg("-oServerAliveInterval=15")
             .arg("-oServerAliveCountMax=3")
-            .arg("-oBatchMode=yes");
+            .arg("-oBatchMode=yes")
+            .arg("-oCiphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com");
 
         if port != 22 {
             cmd.arg("-p").arg(port.to_string());
@@ -761,6 +765,55 @@ impl SftpSession {
     }
 
     pub fn write(&self, handle: &[u8], offset: u64, data: &[u8]) -> SftpResult<()> {
+        let total = data.len() as u64;
+        if total <= MAX_WRITE_SIZE as u64 {
+            return self.write_single(handle, offset, data);
+        }
+
+        let mut written: u64 = 0;
+        while written < total {
+            let mut pending_ids = Vec::new();
+            {
+                let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
+                while pending_ids.len() < WRITE_PIPELINE && written < total {
+                    let chunk_len = ((total - written) as u32).min(MAX_WRITE_SIZE);
+                    let chunk_start = written as usize;
+                    let chunk_end = chunk_start + chunk_len as usize;
+                    let id = self.next_id();
+                    let mut buf = Buf::with_capacity(chunk_len as usize + 32);
+                    buf.put_bytes(handle);
+                    buf.put_u64(offset + written);
+                    buf.put_bytes(&data[chunk_start..chunk_end]);
+                    Self::write_packet(&mut *w, SSH_FXP_WRITE, id, &buf.0)?;
+                    pending_ids.push(id);
+                    written += chunk_len as u64;
+                }
+                w.flush().map_err(|_| SftpError::Disconnected)?;
+            }
+
+            let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
+            for i in 0..pending_ids.len() {
+                let (t, resp) = Self::read_packet(&mut *r)?;
+                if t == SSH_FXP_STATUS {
+                    let mut sr = Reader::new(&resp[4..]);
+                    let code = sr.get_u32()?;
+                    if code != SSH_FX_OK {
+                        let msg = sr.get_string().unwrap_or_default();
+                        let unread = pending_ids.len() - i - 1;
+                        Self::drain_packets(&mut *r, unread);
+                        return Err(SftpError::Status(code, msg));
+                    }
+                } else {
+                    let unread = pending_ids.len() - i - 1;
+                    Self::drain_packets(&mut *r, unread);
+                    return Err(SftpError::Disconnected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_single(&self, handle: &[u8], offset: u64, data: &[u8]) -> SftpResult<()> {
         let mut buf = Buf::with_capacity(data.len() + 32);
         buf.put_bytes(handle);
         buf.put_u64(offset);
@@ -840,26 +893,45 @@ impl SftpSession {
 }
 
 // ── Reconnecting wrapper ─────────────────────────────────────────────
-// Automatically reconnects the SFTP session on disconnect (sleep/wake,
-// network change, remote reboot). Retries the failed operation once.
+// Maintains a pool of SSH connections for parallel I/O. Handles are
+// prefixed with a session index byte so read/write/close route to the
+// correct underlying session.
+
+pub const CONN_STATE_CONNECTED: u8 = 0;
+pub const CONN_STATE_RECONNECTING: u8 = 1;
+pub const CONN_STATE_DISCONNECTED: u8 = 2;
+
+const MAX_RECONNECT_FAILURES: u8 = 3;
+const NUM_CONNECTIONS: usize = 4;
 
 pub struct ReconnectingSftp {
-    session: Mutex<Option<SftpSession>>,
+    sessions: Vec<Mutex<Option<SftpSession>>>,
+    next_session: AtomicU32,
     host: String,
     port: u16,
     user: Option<String>,
     identity: Option<String>,
+    state: Arc<AtomicU8>,
+    fail_count: AtomicU8,
 }
 
 impl ReconnectingSftp {
     #[cfg(test)]
     pub fn dummy() -> Self {
+        let mut sessions = Vec::with_capacity(NUM_CONNECTIONS);
+        sessions.push(Mutex::new(Some(SftpSession::dummy())));
+        for _ in 1..NUM_CONNECTIONS {
+            sessions.push(Mutex::new(None));
+        }
         ReconnectingSftp {
-            session: Mutex::new(Some(SftpSession::dummy())),
+            sessions,
+            next_session: AtomicU32::new(0),
             host: "test".into(),
             port: 22,
             user: None,
             identity: None,
+            state: Arc::new(AtomicU8::new(CONN_STATE_CONNECTED)),
+            fail_count: AtomicU8::new(0),
         }
     }
 
@@ -869,24 +941,45 @@ impl ReconnectingSftp {
         user: Option<&str>,
         identity: Option<&str>,
     ) -> SftpResult<Self> {
-        let session = SftpSession::connect(host, port, user, identity)?;
+        let primary = SftpSession::connect(host, port, user, identity)?;
+        let mut sessions = Vec::with_capacity(NUM_CONNECTIONS);
+        sessions.push(Mutex::new(Some(primary)));
+        for _ in 1..NUM_CONNECTIONS {
+            match SftpSession::connect(host, port, user, identity) {
+                Ok(s) => sessions.push(Mutex::new(Some(s))),
+                Err(_) => sessions.push(Mutex::new(None)),
+            }
+        }
         Ok(ReconnectingSftp {
-            session: Mutex::new(Some(session)),
+            sessions,
+            next_session: AtomicU32::new(0),
             host: host.to_string(),
             port,
             user: user.map(|s| s.to_string()),
             identity: identity.map(|s| s.to_string()),
+            state: Arc::new(AtomicU8::new(CONN_STATE_CONNECTED)),
+            fail_count: AtomicU8::new(0),
         })
     }
 
-    /// Try to reconnect. Returns true on success.
-    fn reconnect(&self) -> bool {
-        log::warn!("SFTP disconnected — reconnecting to {}...", self.host);
-        let mut guard = match self.session.lock() {
+    pub fn state(&self) -> &Arc<AtomicU8> {
+        &self.state
+    }
+
+    fn pick_session(&self) -> usize {
+        (self.next_session.fetch_add(1, Ordering::Relaxed) as usize) % NUM_CONNECTIONS
+    }
+
+    fn reconnect_session(&self, idx: usize) -> bool {
+        self.state.store(CONN_STATE_RECONNECTING, Ordering::SeqCst);
+        log::warn!("SFTP session {idx} disconnected — reconnecting to {}...", self.host);
+        let mut guard = match self.sessions[idx].lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(_) => {
+                self.state.store(CONN_STATE_DISCONNECTED, Ordering::SeqCst);
+                return false;
+            }
         };
-        // Drop the old session (kills SSH process)
         *guard = None;
 
         match SftpSession::connect(
@@ -896,52 +989,69 @@ impl ReconnectingSftp {
             self.identity.as_deref(),
         ) {
             Ok(new_session) => {
-                log::info!("SFTP reconnected to {}", self.host);
+                log::info!("SFTP session {idx} reconnected to {}", self.host);
                 *guard = Some(new_session);
+                self.fail_count.store(0, Ordering::SeqCst);
+                self.state.store(CONN_STATE_CONNECTED, Ordering::SeqCst);
                 true
             }
             Err(e) => {
-                log::error!("SFTP reconnect failed: {e}");
+                log::error!("SFTP session {idx} reconnect failed: {e}");
+                let prev = self.fail_count.fetch_add(1, Ordering::SeqCst);
+                if prev + 1 >= MAX_RECONNECT_FAILURES {
+                    self.state.store(CONN_STATE_DISCONNECTED, Ordering::SeqCst);
+                } else {
+                    self.state.store(CONN_STATE_RECONNECTING, Ordering::SeqCst);
+                }
                 false
             }
         }
     }
 
-    /// Execute an SFTP operation with automatic reconnect on disconnect.
+    fn reconnect(&self) -> bool {
+        self.reconnect_session(0)
+    }
+
+    pub fn force_reconnect(&self) -> bool {
+        self.fail_count.store(0, Ordering::SeqCst);
+        let mut any_ok = false;
+        for i in 0..NUM_CONNECTIONS {
+            if self.reconnect_session(i) {
+                any_ok = true;
+            }
+        }
+        any_ok
+    }
+
     fn with_retry<T, F>(&self, op: F) -> SftpResult<T>
     where
         F: Fn(&SftpSession) -> SftpResult<T>,
     {
-        // First attempt
         {
-            let guard = self.session.lock().map_err(|_| SftpError::Disconnected)?;
+            let guard = self.sessions[0].lock().map_err(|_| SftpError::Disconnected)?;
             if let Some(ref session) = *guard {
                 match op(session) {
-                    // Disconnected or Protocol error = stream is dead/corrupt,
-                    // reconnect to get a fresh session
                     Err(SftpError::Disconnected) | Err(SftpError::Protocol(_)) => {}
                     result => return result,
                 }
             }
         }
 
-        // Reconnect and retry once
-        if !self.reconnect() {
+        if !self.reconnect_session(0) {
             return Err(SftpError::Disconnected);
         }
-        let guard = self.session.lock().map_err(|_| SftpError::Disconnected)?;
+        let guard = self.sessions[0].lock().map_err(|_| SftpError::Disconnected)?;
         match &*guard {
             Some(session) => op(session),
             None => Err(SftpError::Disconnected),
         }
     }
 
-    /// Check if the session is currently connected.
     pub fn is_connected(&self) -> bool {
-        self.session.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.sessions[0].lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
-    // ── Public API (delegates to SftpSession with retry) ─────────────
+    // ── Public API ───────────────────────────────────────────────────────
 
     pub fn realpath(&self, path: &str) -> SftpResult<String> {
         self.with_retry(|s| s.realpath(path))
@@ -960,33 +1070,71 @@ impl ReconnectingSftp {
     }
 
     pub fn open(&self, path: &str, flags: u32, mode: u32) -> SftpResult<Vec<u8>> {
-        self.with_retry(|s| s.open(path, flags, mode))
+        let idx = self.pick_session();
+        let guard = self.sessions[idx].lock().map_err(|_| SftpError::Disconnected)?;
+        match &*guard {
+            Some(session) => {
+                let handle = session.open(path, flags, mode)?;
+                let mut prefixed = Vec::with_capacity(1 + handle.len());
+                prefixed.push(idx as u8);
+                prefixed.extend_from_slice(&handle);
+                Ok(prefixed)
+            }
+            None => {
+                drop(guard);
+                if !self.reconnect_session(idx) {
+                    return Err(SftpError::Disconnected);
+                }
+                let guard = self.sessions[idx].lock().map_err(|_| SftpError::Disconnected)?;
+                match &*guard {
+                    Some(session) => {
+                        let handle = session.open(path, flags, mode)?;
+                        let mut prefixed = Vec::with_capacity(1 + handle.len());
+                        prefixed.push(idx as u8);
+                        prefixed.extend_from_slice(&handle);
+                        Ok(prefixed)
+                    }
+                    None => Err(SftpError::Disconnected),
+                }
+            }
+        }
     }
 
     pub fn close(&self, handle: &[u8]) -> SftpResult<()> {
-        // Don't retry close — handle is invalid after reconnect anyway
-        let guard = self.session.lock().map_err(|_| SftpError::Disconnected)?;
+        if handle.is_empty() {
+            return Ok(());
+        }
+        let idx = handle[0] as usize % NUM_CONNECTIONS;
+        let raw = &handle[1..];
+        let guard = self.sessions[idx].lock().map_err(|_| SftpError::Disconnected)?;
         match &*guard {
-            Some(session) => session.close(handle),
-            None => Ok(()), // silently succeed — nothing to close
+            Some(session) => session.close(raw),
+            None => Ok(()),
         }
     }
 
     pub fn read(&self, handle: &[u8], offset: u64, len: u32) -> SftpResult<Vec<u8>> {
-        // Can't retry reads — the handle is tied to the old session.
-        // Caller must reopen the file on Disconnected.
-        let guard = self.session.lock().map_err(|_| SftpError::Disconnected)?;
+        if handle.is_empty() {
+            return Err(SftpError::Disconnected);
+        }
+        let idx = handle[0] as usize % NUM_CONNECTIONS;
+        let raw = &handle[1..];
+        let guard = self.sessions[idx].lock().map_err(|_| SftpError::Disconnected)?;
         match &*guard {
-            Some(session) => session.read(handle, offset, len),
+            Some(session) => session.read(raw, offset, len),
             None => Err(SftpError::Disconnected),
         }
     }
 
     pub fn write(&self, handle: &[u8], offset: u64, data: &[u8]) -> SftpResult<()> {
-        // Same as read — handle-based ops can't be retried across reconnects
-        let guard = self.session.lock().map_err(|_| SftpError::Disconnected)?;
+        if handle.is_empty() {
+            return Err(SftpError::Disconnected);
+        }
+        let idx = handle[0] as usize % NUM_CONNECTIONS;
+        let raw = &handle[1..];
+        let guard = self.sessions[idx].lock().map_err(|_| SftpError::Disconnected)?;
         match &*guard {
-            Some(session) => session.write(handle, offset, data),
+            Some(session) => session.write(raw, offset, data),
             None => Err(SftpError::Disconnected),
         }
     }

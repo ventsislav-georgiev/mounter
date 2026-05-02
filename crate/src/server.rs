@@ -79,8 +79,9 @@ fn is_spotlight_inhibitor(name: &str) -> bool {
 
 // ── Attr cache ──────────────────────────────────────────────────────
 
-const CACHE_TTL_SECS: u64 = 30;
-const NEG_CACHE_TTL_SECS: u64 = 60; // longer for negative since Apple metadata never exists
+const CACHE_TTL_SECS: u64 = 60;
+const NEG_CACHE_TTL_SECS: u64 = 120; // longer for negative since Apple metadata never exists
+const READAHEAD_SIZE: u32 = 2 * 1024 * 1024; // 2 MB speculative read-ahead
 
 pub struct CachedAttr {
     attr: FileAttr,
@@ -165,7 +166,7 @@ impl AttrCache {
 // macOS sends per-file CREATE+QUERY_DIRECTORY+CLOSE compounds for stat
 // lookups.  Without this cache, each compound triggers a full SFTP readdir.
 
-const DIR_CACHE_TTL_SECS: u64 = 15;
+const DIR_CACHE_TTL_SECS: u64 = 60;
 
 pub struct CachedDir {
     entries: Arc<Vec<DirEntry>>,
@@ -1008,13 +1009,11 @@ impl SmbSession {
             }
         }
 
-        // Read from SFTP — cache result for small follow-up reads.
-        // On disconnect, the ReconnectingSftp will reconnect, but our handle
-        // is dead. Reopen and retry once.
         let sftp_h = handle.sftp_handle.as_ref().map(|h| h.clone());
         let path = handle.path.clone();
+        let fetch_len = READAHEAD_SIZE.max(length as u32);
         match sftp_h {
-            Some(ref h) => match self.sftp.read(h, offset, length as u32) {
+            Some(ref h) => match self.sftp.read(h, offset, fetch_len) {
                 Ok(data) if data.is_empty() => {
                     self.error_response(hdr, STATUS_END_OF_FILE, out);
                 }
@@ -1026,10 +1025,9 @@ impl SmbSession {
                     }
                 }
                 Err(SftpError::Disconnected) | Err(SftpError::Protocol(_)) => {
-                    // Handle is dead or stream corrupt — reconnect, reopen, retry
                     self.on_reconnect();
                     match self.sftp.open(&path, SSH_FXF_READ, 0) {
-                        Ok(new_h) => match self.sftp.read(&new_h, offset, length as u32) {
+                        Ok(new_h) => match self.sftp.read(&new_h, offset, fetch_len) {
                             Ok(data) if data.is_empty() => {
                                 self.error_response(hdr, STATUS_END_OF_FILE, out);
                             }
