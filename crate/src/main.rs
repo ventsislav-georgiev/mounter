@@ -9,7 +9,7 @@ mod sftp;
 mod smb2;
 
 use server::SmbSession;
-use sftp::ReconnectingSftp;
+use sftp::{ReconnectingSftp, CONN_STATE_DISCONNECTED};
 use std::env;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -289,6 +289,36 @@ fn main() {
     } else {
         println!("Mount with:");
         println!("  {}", mount_cmd_hint(local_port, &name));
+    }
+
+    // Health-check thread: probe SFTP connectivity and auto-unmount on failure
+    if mount_point.is_some() {
+        let hc_sftp = Arc::clone(&sftp);
+        let hc_name = name.clone();
+        let hc_port = local_port;
+        let hc_mp = mount_point.clone().unwrap();
+        thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            use std::time::Duration;
+            loop {
+                thread::sleep(Duration::from_secs(15));
+                if hc_sftp.realpath(".").is_err() {
+                    log::warn!("Health-check failed — attempting reconnect");
+                    hc_sftp.force_reconnect();
+                    thread::sleep(Duration::from_secs(2));
+                    if hc_sftp.state().load(Ordering::SeqCst) == CONN_STATE_DISCONNECTED {
+                        log::error!("SFTP disconnected after reconnect — auto-unmounting {hc_name}");
+                        let info = MountInfo {
+                            share: hc_name,
+                            port: hc_port,
+                            path: hc_mp,
+                        };
+                        unmount_one(&info);
+                        process::exit(1);
+                    }
+                }
+            }
+        });
     }
 
     // Accept connections — one thread per client

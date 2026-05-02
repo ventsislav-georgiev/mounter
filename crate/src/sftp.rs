@@ -298,6 +298,7 @@ impl SftpSession {
         identity: Option<&str>,
     ) -> SftpResult<Self> {
         let (our_sock, child_sock) = UnixStream::pair()?;
+        our_sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
         let mut cmd = Command::new("ssh");
         cmd.arg("-oStrictHostKeyChecking=accept-new")
